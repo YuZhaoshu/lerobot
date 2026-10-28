@@ -125,6 +125,7 @@ class DatasetReader(BaseDatasetReader):
         image_transforms: Callable | None,
         return_uint8: bool = False,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
+        parquet_features: dict | None = None,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -155,6 +156,10 @@ class DatasetReader(BaseDatasetReader):
         self.set_image_transforms(image_transforms)
         self._return_uint8 = return_uint8
         self._depth_output_unit = depth_output_unit
+        # Feature projection changes the in-memory metadata, but Parquet shards
+        # still have their complete on-disk schema. Keep that schema available
+        # so Hugging Face can read the raw columns before we project them.
+        self._parquet_features = parquet_features or meta.features
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
@@ -222,8 +227,13 @@ class DatasetReader(BaseDatasetReader):
     def _load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
         features = get_hf_features_from_features(self._meta.features)
-        self._validate_language_columns_declared(features)
-        hf_dataset = load_nested_dataset(self.root / "data", features=features, episodes=self.episodes)
+        parquet_features = get_hf_features_from_features(self._parquet_features)
+        self._validate_language_columns_declared(parquet_features)
+        hf_dataset = load_nested_dataset(
+            self.root / "data", features=parquet_features, episodes=self.episodes
+        )
+        if list(hf_dataset.features) != list(features):
+            hf_dataset = hf_dataset.select_columns(list(features))
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 

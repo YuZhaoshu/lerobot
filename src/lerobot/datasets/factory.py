@@ -13,8 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import logging
 import math
+from pathlib import Path
 from pprint import pformat
 from typing import Literal, cast
 
@@ -24,7 +26,15 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.transforms import ImageTransforms
-from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGE, OBS_PREFIX, OBS_STATE, REWARD
+from lerobot.utils.constants import (
+    ACTION,
+    DEFAULT_FEATURES,
+    IMAGENET_STATS,
+    OBS_IMAGE,
+    OBS_PREFIX,
+    OBS_STATE,
+    REWARD,
+)
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
@@ -105,7 +115,9 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
-def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotDataset:
+def make_dataset(
+    cfg: TrainPipelineConfig, episodes: list[int] | None = None
+) -> LeRobotDataset | StreamingLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
@@ -140,9 +152,25 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
             revision=cfg.dataset.revision,
             repo_type=repo_type,
         )
+        if cfg.dataset.feature_keys is not None:
+            missing_features = sorted(set(cfg.dataset.feature_keys) - set(ds_meta.features))
+            if missing_features:
+                raise ValueError(
+                    f"Requested dataset.feature_keys are missing from metadata: {missing_features}. "
+                    f"Available features: {sorted(ds_meta.features)}"
+                )
+            retained_keys = [
+                key for key in (*cfg.dataset.feature_keys, *DEFAULT_FEATURES) if key in ds_meta.features
+            ]
+            ds_meta.info.features = {key: ds_meta.features[key] for key in retained_keys}
+            if ds_meta.stats is not None:
+                ds_meta.stats = {
+                    key: value for key, value in ds_meta.stats.items() if key in cfg.dataset.feature_keys
+                }
         delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta, cfg.rename_map)
-        episodes = resolve_episode_indices(
-            cfg.dataset.episodes, ds_meta.total_episodes, cfg.dataset.exclude_episodes
+        selected_episodes = episodes if episodes is not None else cfg.dataset.episodes
+        selected_episodes = resolve_episode_indices(
+            selected_episodes, ds_meta.total_episodes, cfg.dataset.exclude_episodes
         )
         if cfg.dataset.streaming and ds_meta.storage_format != DEFAULT_STORAGE_FORMAT:
             raise ValueError(
@@ -160,7 +188,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
-                episodes=episodes,
+                episodes=selected_episodes,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
@@ -170,12 +198,13 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
                 tolerance_s=cfg.tolerance_s,
                 repo_type=repo_type,
                 video_decoder_cache_size=cfg.dataset.video_decoder_cache_size,
+                feature_keys=cfg.dataset.feature_keys,
             )
         else:
             dataset = StreamingLeRobotDataset(
                 cfg.dataset.repo_id,
                 root=root,
-                episodes=episodes,
+                episodes=selected_episodes,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
@@ -220,17 +249,141 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
+    _apply_normalization_stats(dataset, cfg.dataset.normalization_stats_path)
+
     return dataset
+
+
+def _apply_normalization_stats(dataset: LeRobotDataset, stats_path: str | None) -> None:
+    """Apply local stats without falling back to potentially leaky dataset-wide stats."""
+    if stats_path is None:
+        return
+    stats_path = Path(stats_path).expanduser()
+    if not stats_path.is_file():
+        raise FileNotFoundError(f"Normalization statistics file does not exist: {stats_path}")
+    custom_stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    if not isinstance(custom_stats, dict):
+        raise ValueError(f"Normalization statistics must be a JSON object: {stats_path}")
+
+    # State and action use MEAN_STD for ACT. Require the supplied train-only values
+    # for these features so a missing JSON entry cannot silently fall back to the
+    # raw dataset's all-episode metadata statistics.
+    required = {key for key in (ACTION, OBS_STATE) if key in dataset.meta.features}
+    missing = sorted(required - set(custom_stats))
+    if missing:
+        raise ValueError(f"Normalization stats are missing required features {missing}: {stats_path}")
+
+    if dataset.meta.stats is None:
+        dataset.meta.stats = {}
+    for key, feature_stats in custom_stats.items():
+        if key not in dataset.meta.features:
+            raise ValueError(f"Normalization stats contain unknown feature {key!r}.")
+        if not isinstance(feature_stats, dict):
+            raise ValueError(f"Normalization stats for {key!r} must be a JSON object.")
+        normalized = {
+            name: torch.as_tensor(value, dtype=torch.float32) if isinstance(value, list) else value
+            for name, value in feature_stats.items()
+        }
+        if key in required:
+            feature_shape = tuple(dataset.meta.features[key]["shape"])
+            for name in ("mean", "std"):
+                if name not in normalized:
+                    raise ValueError(f"Normalization stats for {key!r} must include {name!r}.")
+                if not isinstance(normalized[name], torch.Tensor):
+                    raise ValueError(f"Normalization {name} for {key!r} must be a numeric vector.")
+                if tuple(normalized[name].shape) != feature_shape:
+                    raise ValueError(
+                        f"Normalization {name} for {key!r} has shape {tuple(normalized[name].shape)}, "
+                        f"expected {feature_shape}."
+                    )
+        dataset.meta.stats[key] = normalized
 
 
 def make_train_eval_datasets(
     cfg: TrainPipelineConfig,
 ) -> tuple[LeRobotDataset | StreamingLeRobotDataset, LeRobotDataset | None]:
-    """Create train and optional eval datasets by splitting episodes based on eval_split.
+    """Create train and optional eval datasets from a split manifest or eval_split.
 
-    The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
-    If eval_split == 0.0, returns (full_dataset, None).
+    A manifest may provide an empty validation list; in that case the function returns
+    the selected training episodes and ``None`` for the eval dataset.
     """
+    if cfg.dataset.split_manifest_path is not None:
+        manifest_path = Path(cfg.dataset.split_manifest_path).expanduser()
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Episode split manifest does not exist: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        train_episodes = manifest.get("train_episode_indices")
+        eval_episodes = manifest.get("validation_episode_indices")
+        excluded_episodes = manifest.get("excluded_episode_indices", [])
+        if not isinstance(train_episodes, list) or not isinstance(eval_episodes, list):
+            raise ValueError(
+                "Split manifest must contain train_episode_indices and validation_episode_indices lists."
+            )
+        if not isinstance(excluded_episodes, list):
+            raise ValueError("Split manifest excluded_episode_indices must be a list.")
+        for name, indices in (
+            ("train_episode_indices", train_episodes),
+            ("validation_episode_indices", eval_episodes),
+            ("excluded_episode_indices", excluded_episodes),
+        ):
+            if any(type(index) is not int for index in indices):
+                raise ValueError(f"Split manifest {name} must contain only integer episode indices.")
+        groups = [set(train_episodes), set(eval_episodes), set(excluded_episodes)]
+        if any(groups[i] & groups[j] for i in range(3) for j in range(i + 1, 3)):
+            raise ValueError(
+                "Train, validation, and excluded episode lists in the manifest must be disjoint."
+            )
+        if not train_episodes:
+            raise ValueError("Split manifest must provide a non-empty training episode list.")
+        if cfg.dataset.episodes is not None:
+            raise ValueError("Set either dataset.episodes or dataset.split_manifest_path, not both.")
+        if not isinstance(cfg.dataset.repo_id, str):
+            raise ValueError("dataset.split_manifest_path requires a single dataset repo_id.")
+        metadata = load_dataset_metadata(
+            cfg.dataset.repo_id,
+            root=cfg.dataset.root,
+            revision=cfg.dataset.revision,
+            repo_type=cast(Literal["dataset", "bucket"], cfg.dataset.repo_type),
+        )
+        if manifest.get("codebase_version") != metadata.info.codebase_version:
+            raise ValueError(
+                "Split manifest codebase_version does not match the dataset: "
+                f"{manifest.get('codebase_version')!r} != {metadata.info.codebase_version!r}."
+            )
+        if manifest.get("fps") != metadata.fps:
+            raise ValueError(
+                f"Split manifest fps {manifest.get('fps')!r} does not match dataset fps {metadata.fps}."
+            )
+        declared_root = manifest.get("dataset_root")
+        if (
+            declared_root is not None
+            and Path(declared_root).expanduser().resolve() != metadata.root.resolve()
+        ):
+            raise ValueError(
+                f"Split manifest dataset_root {declared_root!r} does not match dataset root {str(metadata.root)!r}."
+            )
+        for name, indices in (
+            ("train_episode_indices", train_episodes),
+            ("validation_episode_indices", eval_episodes),
+            ("excluded_episode_indices", excluded_episodes),
+        ):
+            if not isinstance(indices, list) or any(type(index) is not int for index in indices):
+                raise ValueError(f"Split manifest {name} must be a list of integer episode indices.")
+            if len(indices) != len(set(indices)):
+                raise ValueError(f"Split manifest {name} contains duplicate episode indices.")
+            invalid = [index for index in indices if not 0 <= index < metadata.total_episodes]
+            if invalid:
+                raise ValueError(f"Split manifest {name} has out-of-range indices: {invalid}.")
+        logger.info(
+            "Using episode split manifest: %d train, %d validation, %d excluded",
+            len(train_episodes),
+            len(eval_episodes),
+            len(excluded_episodes),
+        )
+        train_dataset = make_dataset(cfg, episodes=train_episodes)
+        eval_dataset = make_dataset(cfg, episodes=eval_episodes) if eval_episodes else None
+        return train_dataset, eval_dataset
+
     full_dataset = make_dataset(cfg)
 
     if cfg.dataset.eval_split == 0.0:
@@ -285,6 +438,7 @@ def make_train_eval_datasets(
         tolerance_s=cfg.tolerance_s,
         repo_type=cfg.dataset.repo_type,
         video_decoder_cache_size=cfg.dataset.video_decoder_cache_size,
+        feature_keys=cfg.dataset.feature_keys,
     )
 
     eval_dataset = LeRobotDataset(
@@ -300,6 +454,7 @@ def make_train_eval_datasets(
         tolerance_s=cfg.tolerance_s,
         repo_type=cfg.dataset.repo_type,
         video_decoder_cache_size=cfg.dataset.video_decoder_cache_size,
+        feature_keys=cfg.dataset.feature_keys,
     )
 
     if cfg.dataset.use_imagenet_stats:
@@ -310,5 +465,8 @@ def make_train_eval_datasets(
                 ds.meta.stats.setdefault(key, {})
                 for stats_type, stats in IMAGENET_STATS.items():
                     ds.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+
+    for ds in (train_dataset, eval_dataset):
+        _apply_normalization_stats(ds, cfg.dataset.normalization_stats_path)
 
     return train_dataset, eval_dataset

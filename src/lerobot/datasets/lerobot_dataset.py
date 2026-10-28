@@ -26,7 +26,7 @@ from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RevisionNotFoundError
 
 from lerobot.configs import DEFAULT_DEPTH_UNIT, DepthEncoderConfig, RGBEncoderConfig
-from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
+from lerobot.utils.constants import DEFAULT_FEATURES, HF_LEROBOT_HUB_CACHE
 from lerobot.utils.import_utils import get_safe_default_video_backend
 
 from .dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
@@ -75,6 +75,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         repo_type: str = "dataset",
         token: str | bool | None = None,
         video_decoder_cache_size: int | None = None,
+        feature_keys: list[str] | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -266,6 +267,25 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.root = self.meta.root
         self.revision = self.meta.revision
         self.meta.rescale_depth_stats(self._depth_output_unit)
+        parquet_features = dict(self.meta.features)
+        self._parquet_features = parquet_features
+
+        if feature_keys is not None:
+            missing_features = sorted(set(feature_keys) - set(self.meta.features))
+            if missing_features:
+                raise ValueError(
+                    f"Requested dataset.feature_keys are missing from metadata: {missing_features}. "
+                    f"Available features: {sorted(self.meta.features)}"
+                )
+            # Project only this in-memory metadata instance before the native reader
+            # builds its Arrow schema and video stream list. Keep LeRobot's required
+            # index/timestamp columns while ignoring other raw observations.
+            retained_keys = [key for key in (*feature_keys, *DEFAULT_FEATURES) if key in self.meta.features]
+            self.meta.info.features = {key: self.meta.features[key] for key in retained_keys}
+            if self.meta.stats is not None:
+                self.meta.stats = {
+                    key: value for key, value in self.meta.stats.items() if key in feature_keys
+                }
 
         if episodes is not None and any(
             episode >= self.meta.total_episodes or episode < 0 for episode in episodes
@@ -329,6 +349,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             image_transforms=image_transforms,
             return_uint8=return_uint8,
             depth_output_unit=depth_output_unit,
+            parquet_features=parquet_features,
         )
         self.reader = reader
 
@@ -419,6 +440,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 image_transforms=self.image_transforms,
                 return_uint8=self._return_uint8,
                 depth_output_unit=self._depth_output_unit,
+                parquet_features=getattr(self, "_parquet_features", None),
             )
         return self.reader
 

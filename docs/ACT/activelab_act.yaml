@@ -1,0 +1,53 @@
+# Complete single-task configuration example. Run `activelab-act prepare` first;
+# asset_dir=null selects the latest prepared fingerprint for the selected task.
+task: insert_the_funnel_into_the_measuring_cylinder
+data_root: /home/yuzhaoshu/data/active_data/ActiveLab_Data
+model_root: /home/yuzhaoshu/data/model/act
+asset_dir: null
+run_name: funnel-act-seed42-v1
+seed: 42
+validation_fraction: 0.0
+feature_keys:
+  - observation.state
+  - observation.images.head.active_view
+  - observation.images.left.wrist
+  - observation.images.right.wrist
+  - action
+model:
+  state_action_dim: 20
+  camera_keys:
+    - observation.images.head.active_view
+    - observation.images.left.wrist
+    - observation.images.right.wrist
+  image_size_hw: [480, 640]
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+  dim_model: 512
+  dim_feedforward: 3200
+  n_heads: 8
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+  dropout: 0.1
+  optimizer_lr: 0.00001
+  optimizer_lr_backbone: 0.00001
+  optimizer_weight_decay: 0.0001
+  grad_clip_norm: 10.0
+training:
+  steps: 100000
+  batch_size: 8
+  log_freq: 200
+  save_freq: 20000
+  eval_steps: 0
+  num_workers: 4
+wandb:
+  project: activelab-act
+  entity: null
+  mode: online
+  disable_artifact: false

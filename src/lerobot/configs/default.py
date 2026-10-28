@@ -42,6 +42,12 @@ class DatasetConfig:
     # With streaming=true, an 'hf://buckets/OWNER/BUCKET' URI is also accepted and implies repo_type="bucket".
     root: str | None = None
     episodes: list[int] | None = None
+    # Optional in-memory projection of a dataset's declared features. The raw
+    # LeRobot metadata and parquet files are never modified.
+    feature_keys: list[str] | None = None
+    # Optional episode split and normalization assets for reproducible local training.
+    split_manifest_path: str | None = None
+    normalization_stats_path: str | None = None
     # Episode indices to drop (e.g. corrupt or heterogeneous ones). Applied on top of `episodes`.
     exclude_episodes: list[int] | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
@@ -86,6 +92,12 @@ class DatasetConfig:
             raise ValueError(
                 "eval_split requires map-style datasets and is not supported with dataset.streaming=true."
             )
+        if self.split_manifest_path is not None and self.streaming:
+            raise ValueError("dataset.split_manifest_path requires a map-style dataset (streaming=false).")
+        if self.feature_keys is not None and self.streaming:
+            raise ValueError("dataset.feature_keys currently requires a map-style dataset (streaming=false).")
+        if self.split_manifest_path is not None and self.episodes is not None:
+            raise ValueError("Set either dataset.episodes or dataset.split_manifest_path, not both.")
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
             raise ValueError(
                 f"depth_output_unit must be '{DEPTH_METER_UNIT}' or '{DEPTH_MILLIMETER_UNIT}', got {self.depth_output_unit!r}"
@@ -119,6 +131,11 @@ class DatasetConfig:
             if len(self.episodes) != len(set(self.episodes)):
                 duplicates = sorted({ep for ep in self.episodes if self.episodes.count(ep) > 1})
                 raise ValueError(f"Episode indices contain duplicates: {duplicates}")
+        if self.feature_keys is not None:
+            if len(self.feature_keys) != len(set(self.feature_keys)):
+                raise ValueError("dataset.feature_keys must not contain duplicates.")
+            if not self.feature_keys:
+                raise ValueError("dataset.feature_keys must not be empty when provided.")
         if self.exclude_episodes is not None:
             negative_episodes = [episode for episode in self.exclude_episodes if episode < 0]
             if negative_episodes:
